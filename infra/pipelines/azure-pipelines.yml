@@ -1,0 +1,202 @@
+
+trigger:
+  branches:
+    include:
+      - main
+      - feature/*
+      - develop
+
+# Optional: PR validation
+pr:
+  branches:
+    include:
+      - main
+      - develop
+
+variables:
+  # Remote state
+  TFSTATE_RG:        'rg-tfstate-demo'
+  TFSTATE_SA:        '<replace-with-your-SA-name>'
+  TFSTATE_CONTAINER: 'tfstate'
+
+  # Keys per env
+  TFSTATE_KEY_DEV:   'infra-dev.tfstate'
+  TFSTATE_KEY_PROD:  'infra-prod.tfstate'
+
+  # Terraform working dir
+  TF_WORKING_DIR: 'infra'
+
+  # Optional: set region once; tfvars can override
+  LOCATION: 'southindia'
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+stages:
+# 1) Validate
+- stage: Validate
+  displayName: 'Terraform Validate'
+  jobs:
+  - job: validate
+    steps:
+    - checkout: self
+
+    # Install Terraform via task (install Microsoft 'Terraform' extension in Azure DevOps)
+    - task: TerraformInstaller@1
+      displayName: 'Install Terraform'
+      inputs:
+        terraformVersion: '1.7.5'
+
+    # Use AzureCLI with service connection to run terraform (OIDC auth)
+    - task: AzureCLI@2
+      displayName: 'terraform fmt & validate'
+      inputs:
+        azureSubscription: 'sc-azure-oidc'   # your service connection name
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          set -e
+          cd $(TF_WORKING_DIR)
+
+          terraform -version
+
+          # Backend config for dev just to validate init
+          terraform init \
+            -backend-config="resource_group_name=$(TFSTATE_RG)" \
+            -backend-config="storage_account_name=$(TFSTATE_SA)" \
+            -backend-config="container_name=$(TFSTATE_CONTAINER)" \
+            -backend-config="key=$(TFSTATE_KEY_DEV)" \
+            -reconfigure
+
+          terraform fmt -check
+          terraform validate
+
+# 2) Plan+Apply DEV
+- stage: Dev
+  displayName: 'Deploy DEV'
+  dependsOn: Validate
+  jobs:
+  - job: plan_dev
+    displayName: 'Plan DEV'
+    steps:
+    - checkout: self
+    - task: TerraformInstaller@1
+      inputs:
+        terraformVersion: '1.7.5'
+    - task: AzureCLI@2
+      displayName: 'terraform plan (dev)'
+      inputs:
+        azureSubscription: 'sc-azure-oidc'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          set -e
+          cd $(TF_WORKING_DIR)
+
+          terraform init \
+            -backend-config="resource_group_name=$(TFSTATE_RG)" \
+            -backend-config="storage_account_name=$(TFSTATE_SA)" \
+            -backend-config="container_name=$(TFSTATE_CONTAINER)" \
+            -backend-config="key=$(TFSTATE_KEY_DEV)" \
+            -reconfigure
+
+          terraform plan -var-file="env/dev.tfvars" -out "tfplan-dev"
+          terraform show -no-color tfplan-dev > tfplan-dev.txt
+    - publish: $(TF_WORKING_DIR)/tfplan-dev.txt
+      artifact: tfplan-dev
+
+  - deployment: apply_dev
+    displayName: 'Apply DEV'
+    environment: 'dev' # Add approvals to this environment in Azure DevOps
+    dependsOn: plan_dev
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+          - task: TerraformInstaller@1
+            inputs:
+              terraformVersion: '1.7.5'
+          - task: AzureCLI@2
+            displayName: 'terraform apply (dev)'
+            inputs:
+              azureSubscription: 'sc-azure-oidc'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                set -e
+                cd $(TF_WORKING_DIR)
+
+                terraform init \
+                  -backend-config="resource_group_name=$(TFSTATE_RG)" \
+                  -backend-config="storage_account_name=$(TFSTATE_SA)" \
+                  -backend-config="container_name=$(TFSTATE_CONTAINER)" \
+                  -backend-config="key=$(TFSTATE_KEY_DEV)" \
+                  -reconfigure
+
+                terraform apply -auto-approve -var-file="env/dev.tfvars"
+
+# 3) Plan+Apply PROD
+- stage: Prod
+  displayName: 'Deploy PROD'
+  dependsOn: Dev
+  jobs:
+  - job: plan_prod
+    displayName: 'Plan PROD'
+    steps:
+    - checkout: self
+    - task: TerraformInstaller@1
+      inputs:
+        terraformVersion: '1.7.5'
+    - task: AzureCLI@2
+      displayName: 'terraform plan (prod)'
+      inputs:
+        azureSubscription: 'sc-azure-oidc'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          set -e
+          cd $(TF_WORKING_DIR)
+
+          terraform init \
+            -backend-config="resource_group_name=$(TFSTATE_RG)" \
+            -backend-config="storage_account_name=$(TFSTATE_SA)" \
+            -backend-config="container_name=$(TFSTATE_CONTAINER)" \
+            -backend-config="key=$(TFSTATE_KEY_PROD)" \
+            -reconfigure
+
+          terraform plan -var-file="env/prod.tfvars" -out "tfplan-prod"
+          terraform show -no-color tfplan-prod > tfplan-prod.txt
+    - publish: $(TF_WORKING_DIR)/tfplan-prod.txt
+      artifact: tfplan-prod
+
+  - deployment: apply_prod
+    displayName: 'Apply PROD'
+    environment: 'prod' # Add approvals to this environment
+    dependsOn: plan_prod
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+          - task: TerraformInstaller@1
+            inputs:
+              terraformVersion: '1.7.5'
+          - task: AzureCLI@2
+            displayName: 'terraform apply (prod)'
+            inputs:
+              azureSubscription: 'sc-azure-oidc'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                set -e
+                cd $(TF_WORKING_DIR)
+
+                terraform init \
+                  -backend-config="resource_group_name=$(TFSTATE_RG)" \
+                  -backend-config="storage_account_name=$(TFSTATE_SA)" \
+                  -backend-config="container_name=$(TFSTATE_CONTAINER)" \
+                  -backend-config="key=$(TFSTATE_KEY_PROD)" \
+                  -reconfigure
+
+                terraform apply -auto-approve -var-file="env/prod.tfvars"
