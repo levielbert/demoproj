@@ -54,3 +54,4 @@ resource "azurerm_storage_account" "sa" {
   https_traffic_only_enabled = true
 
   tags = var.tags
+}
